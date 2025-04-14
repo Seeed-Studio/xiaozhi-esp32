@@ -31,8 +31,8 @@
 
         "CONNECT_TO_HOTSPOT": "Hotspot: ",
         "ACCESS_VIA_BROWSER": " Config URL: ",
-        "WIFI_CONFIG_MODE": "Wi-Fi Configuration Mode",
-        "ENTERING_WIFI_CONFIG_MODE": "Entering Wi-Fi configuration mode...",
+        "WIFI_CONFIG_MODE": "Wi-Fi Config Mode",
+        "ENTERING_WIFI_CONFIG_MODE": "Entering Wi-Fi Config mode...",
         "SCANNING_WIFI": "Scanning Wi-Fi...",
 
         "NEW_VERSION": "New version ",
