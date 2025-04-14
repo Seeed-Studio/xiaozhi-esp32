@@ -8,7 +8,10 @@
                 "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions_32M_sensecap.csv\"",
                 "CONFIG_BOOTLOADER_CACHE_32BIT_ADDR_QUAD_FLASH=y",
                 "CONFIG_ESPTOOLPY_FLASH_MODE_AUTO_DETECT=n",
-                "CONFIG_IDF_EXPERIMENTAL_FEATURES=y"
+                "CONFIG_IDF_EXPERIMENTAL_FEATURES=y",
+                "CONFIG_LANGUAGE_EN_US=y",
+                "CONFIG_CONNECTION_TYPE_MQTT_UDP=y",
+                "CONFIG_SR_WN_WN9_JARVIS_TTS=y"   
             ]
         }
     ]
