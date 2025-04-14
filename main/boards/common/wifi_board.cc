@@ -116,6 +116,12 @@ Http* WifiBoard::CreateHttp() {
 WebSocket* WifiBoard::CreateWebSocket() {
 #ifdef CONFIG_CONNECTION_TYPE_WEBSOCKET
     std::string url = CONFIG_WEBSOCKET_URL;
+    Settings settings("websocket", false);
+    std::string config_url = settings.GetString("url");
+    if ( !config_url.empty() ) {
+        url = config_url;
+    }
+    ESP_LOGI(TAG, "WebSocket URL: %s", url.c_str());
     if (url.find("wss://") == 0) {
         return new WebSocket(new TlsTransport());
     } else {
