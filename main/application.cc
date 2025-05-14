@@ -10,6 +10,12 @@
 #include "iot/thing_manager.h"
 #include "assets/lang_config.h"
 
+#if CONFIG_USE_AUDIO_PROCESSOR
+#include "afe_audio_processor.h"
+#else
+#include "dummy_audio_processor.h"
+#endif
+
 #include <cstring>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -36,6 +42,12 @@ static const char* const STATE_STRINGS[] = {
 Application::Application() {
     event_group_ = xEventGroupCreate();
     background_task_ = new BackgroundTask(4096 * 8);
+
+#if CONFIG_USE_AUDIO_PROCESSOR
+    audio_processor_ = std::make_unique<AfeAudioProcessor>();
+#else
+    audio_processor_ = std::make_unique<DummyAudioProcessor>();
+#endif
 
     esp_timer_create_args_t clock_timer_args = {
         .callback = [](void* arg) {
@@ -65,20 +77,36 @@ Application::~Application() {
 void Application::CheckNewVersion() {
     const int MAX_RETRY = 10;
     int retry_count = 0;
+    int retry_delay = 10; // 初始重试延迟为10秒
 
     while (true) {
+        SetDeviceState(kDeviceStateActivating);
         auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+
         if (!ota_.CheckVersion()) {
             retry_count++;
             if (retry_count >= MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
                 return;
             }
-            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", 60, retry_count, MAX_RETRY);
-            vTaskDelay(pdMS_TO_TICKS(60000));
+
+            char buffer[128];
+            snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, retry_delay, ota_.GetCheckVersionUrl().c_str());
+            Alert(Lang::Strings::ERROR, buffer, "sad", Lang::Sounds::P3_EXCLAMATION);
+
+            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
+            for (int i = 0; i < retry_delay; i++) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (device_state_ == kDeviceStateIdle) {
+                    break;
+                }
+            }
+            retry_delay *= 2; // 每次重试后延迟时间翻倍
             continue;
         }
         retry_count = 0;
+        retry_delay = 10; // 重置重试延迟时间
 
         if (ota_.HasNewVersion()) {
             Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "happy", Lang::Sounds::P3_UPGRADE);
@@ -125,24 +153,34 @@ void Application::CheckNewVersion() {
 
         // No new version, mark the current version as valid
         ota_.MarkCurrentVersionValid();
-        if (ota_.HasActivationCode()) {
-            // Activation code is valid
-            SetDeviceState(kDeviceStateActivating);
-            ShowActivationCode();
-
-            // Check again in 60 seconds or until the device is idle
-            for (int i = 0; i < 60; ++i) {
-                if (device_state_ == kDeviceStateIdle) {
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-            continue;
+        if (!ota_.HasActivationCode() && !ota_.HasActivationChallenge()) {
+            xEventGroupSetBits(event_group_, CHECK_NEW_VERSION_DONE_EVENT);
+            // Exit the loop if done checking new version
+            break;
         }
 
-        xEventGroupSetBits(event_group_, CHECK_NEW_VERSION_DONE_EVENT);
-        // Exit the loop if done checking new version
-        break;
+        display->SetStatus(Lang::Strings::ACTIVATION);
+        // Activation code is shown to the user and waiting for the user to input
+        if (ota_.HasActivationCode()) {
+            ShowActivationCode();
+        }
+
+        // This will block the loop until the activation is done or timeout
+        for (int i = 0; i < 10; ++i) {
+            ESP_LOGI(TAG, "Activating... %d/%d", i + 1, 10);
+            esp_err_t err = ota_.Activate();
+            if (err == ESP_OK) {
+                xEventGroupSetBits(event_group_, CHECK_NEW_VERSION_DONE_EVENT);
+                break;
+            } else if (err == ESP_ERR_TIMEOUT) {
+                vTaskDelay(pdMS_TO_TICKS(3000));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(10000));
+            }
+            if (device_state_ == kDeviceStateIdle) {
+                break;
+            }
+        }
     }
 }
 
@@ -219,13 +257,13 @@ void Application::PlaySound(const std::string_view& sound) {
         p += sizeof(BinaryProtocol3);
 
         auto payload_size = ntohs(p3->payload_size);
-        std::vector<uint8_t> opus;
-        opus.resize(payload_size);
-        memcpy(opus.data(), p3->payload, payload_size);
+        AudioStreamPacket packet;
+        packet.payload.resize(payload_size);
+        memcpy(packet.payload.data(), p3->payload, payload_size);
         p += payload_size;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        audio_decode_queue_.emplace_back(std::move(opus));
+        audio_decode_queue_.emplace_back(std::move(packet));
     }
 }
 
@@ -337,35 +375,47 @@ void Application::Start() {
     }
     codec->Start();
 
+#if CONFIG_USE_AUDIO_PROCESSOR
     xTaskCreatePinnedToCore([](void* arg) {
         Application* app = (Application*)arg;
         app->AudioLoop();
         vTaskDelete(NULL);
-    }, "audio_loop", 4096 * 2, this, 8, &audio_loop_task_handle_, realtime_chat_enabled_ ? 1 : 0);
+    }, "audio_loop", 4096 * 2, this, 8, &audio_loop_task_handle_, 1);
+#else
+    xTaskCreate([](void* arg) {
+        Application* app = (Application*)arg;
+        app->AudioLoop();
+        vTaskDelete(NULL);
+    }, "audio_loop", 4096 * 2, this, 8, &audio_loop_task_handle_);
+#endif
 
     /* Wait for the network to be ready */
     board.StartNetwork();
 
     // Check for new firmware version or get the MQTT broker address
-    display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
     CheckNewVersion();
 
     // Initialize the protocol
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
-#ifdef CONFIG_CONNECTION_TYPE_WEBSOCKET
-    protocol_ = std::make_unique<WebsocketProtocol>();
-#else
-    protocol_ = std::make_unique<MqttProtocol>();
-#endif
+
+    if (ota_.HasMqttConfig()) {
+        protocol_ = std::make_unique<MqttProtocol>();
+    } else if (ota_.HasWebsocketConfig()) {
+        protocol_ = std::make_unique<WebsocketProtocol>();
+    } else {
+        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
+        protocol_ = std::make_unique<MqttProtocol>();
+    }
+
     protocol_->OnNetworkError([this](const std::string& message) {
         SetDeviceState(kDeviceStateIdle);
         Alert(Lang::Strings::ERROR, message.c_str(), "sad", Lang::Sounds::P3_EXCLAMATION);
     });
-    protocol_->OnIncomingAudio([this](std::vector<uint8_t>&& data) {
-        const int max_packets_in_queue = 300 / OPUS_FRAME_DURATION_MS;
+    protocol_->OnIncomingAudio([this](AudioStreamPacket&& packet) {
+        const int max_packets_in_queue = 600 / OPUS_FRAME_DURATION_MS;
         std::lock_guard<std::mutex> lock(mutex_);
         if (audio_decode_queue_.size() < max_packets_in_queue) {
-            audio_decode_queue_.emplace_back(std::move(data));
+            audio_decode_queue_.emplace_back(std::move(packet));
         }
     });
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
@@ -446,25 +496,50 @@ void Application::Start() {
                     thing_manager.Invoke(command);
                 }
             }
+        } else if (strcmp(type->valuestring, "system") == 0) {
+            auto command = cJSON_GetObjectItem(root, "command");
+            if (command != NULL) {
+                ESP_LOGI(TAG, "System command: %s", command->valuestring);
+                if (strcmp(command->valuestring, "reboot") == 0) {
+                    // Do a reboot if user requests a OTA update
+                    Schedule([this]() {
+                        Reboot();
+                    });
+                } else {
+                    ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
+                }
+            }
+        } else if (strcmp(type->valuestring, "alert") == 0) {
+            auto status = cJSON_GetObjectItem(root, "status");
+            auto message = cJSON_GetObjectItem(root, "message");
+            auto emotion = cJSON_GetObjectItem(root, "emotion");
+            if (status != NULL && message != NULL && emotion != NULL) {
+                Alert(status->valuestring, message->valuestring, emotion->valuestring, Lang::Sounds::P3_VIBRATION);
+            } else {
+                ESP_LOGW(TAG, "Alert command requires status, message and emotion");
+            }
         }
     });
-    protocol_->Start();
+    bool protocol_started = protocol_->Start();
 
-#if CONFIG_USE_AUDIO_PROCESSOR
-    audio_processor_.Initialize(codec, realtime_chat_enabled_);
-    audio_processor_.OnOutput([this](std::vector<int16_t>&& data) {
+    audio_processor_->Initialize(codec);
+    audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
         background_task_->Schedule([this, data = std::move(data)]() mutable {
             if (protocol_->IsAudioChannelBusy()) {
                 return;
             }
             opus_encoder_->Encode(std::move(data), [this](std::vector<uint8_t>&& opus) {
-                Schedule([this, opus = std::move(opus)]() {
-                    protocol_->SendAudio(opus);
+                AudioStreamPacket packet;
+                packet.payload = std::move(opus);
+                packet.timestamp = last_output_timestamp_;
+                last_output_timestamp_ = 0;
+                Schedule([this, packet = std::move(packet)]() {
+                    protocol_->SendAudio(packet);
                 });
             });
         });
     });
-    audio_processor_.OnVadStateChange([this](bool speaking) {
+    audio_processor_->OnVadStateChange([this](bool speaking) {
         if (device_state_ == kDeviceStateListening) {
             Schedule([this, speaking]() {
                 if (speaking) {
@@ -477,7 +552,6 @@ void Application::Start() {
             });
         }
     });
-#endif
 
 #if CONFIG_USE_WAKE_WORD_DETECT
     wake_word_detect_.Initialize(codec);
@@ -487,15 +561,15 @@ void Application::Start() {
                 SetDeviceState(kDeviceStateConnecting);
                 wake_word_detect_.EncodeWakeWordData();
 
-                if (!protocol_->OpenAudioChannel()) {
+                if (!protocol_ || !protocol_->OpenAudioChannel()) {
                     wake_word_detect_.StartDetection();
                     return;
                 }
                 
-                std::vector<uint8_t> opus;
+                AudioStreamPacket packet;
                 // Encode and send the wake word data to the server
-                while (wake_word_detect_.GetWakeWordOpus(opus)) {
-                    protocol_->SendAudio(opus);
+                while (wake_word_detect_.GetWakeWordOpus(packet.payload)) {
+                    protocol_->SendAudio(packet);
                 }
                 // Set the chat state to wake word detected
                 protocol_->SendWakeWordDetected(wake_word);
@@ -514,12 +588,15 @@ void Application::Start() {
     // Wait for the new version check to finish
     xEventGroupWaitBits(event_group_, CHECK_NEW_VERSION_DONE_EVENT, pdTRUE, pdFALSE, portMAX_DELAY);
     SetDeviceState(kDeviceStateIdle);
-    std::string message = std::string(Lang::Strings::VERSION) + ota_.GetCurrentVersion();
-    display->ShowNotification(message.c_str());
-    display->SetChatMessage("system", "");
-    // Play the success sound to indicate the device is ready
-    ResetDecoder();
-    PlaySound(Lang::Sounds::P3_SUCCESS);
+
+    if (protocol_started) {
+        std::string message = std::string(Lang::Strings::VERSION) + ota_.GetCurrentVersion();
+        display->ShowNotification(message.c_str());
+        display->SetChatMessage("system", "");
+        // Play the success sound to indicate the device is ready
+        ResetDecoder();
+        PlaySound(Lang::Sounds::P3_SUCCESS);
+    }
     
     // Enter the main event loop
     MainEventLoop();
@@ -616,20 +693,20 @@ void Application::OnAudioOutput() {
         return;
     }
 
-    auto opus = std::move(audio_decode_queue_.front());
+    auto packet = std::move(audio_decode_queue_.front());
     audio_decode_queue_.pop_front();
     lock.unlock();
     audio_decode_cv_.notify_all();
 
     busy_decoding_audio_ = true;
-    background_task_->Schedule([this, codec, opus = std::move(opus)]() mutable {
+    background_task_->Schedule([this, codec, packet = std::move(packet)]() mutable {
         busy_decoding_audio_ = false;
         if (aborted_) {
             return;
         }
 
         std::vector<int16_t> pcm;
-        if (!opus_decoder_->Decode(std::move(opus), pcm)) {
+        if (!opus_decoder_->Decode(std::move(packet.payload), pcm)) {
             return;
         }
         // Resample if the sample rate is different
@@ -640,6 +717,7 @@ void Application::OnAudioOutput() {
             pcm = std::move(resampled);
         }
         codec->OutputData(pcm);
+        last_output_timestamp_ = packet.timestamp;
         last_output_time_ = std::chrono::steady_clock::now();
     });
 }
@@ -648,35 +726,24 @@ void Application::OnAudioInput() {
 #if CONFIG_USE_WAKE_WORD_DETECT
     if (wake_word_detect_.IsDetectionRunning()) {
         std::vector<int16_t> data;
-        ReadAudio(data, 16000, wake_word_detect_.GetFeedSize());
-        wake_word_detect_.Feed(data);
-        return;
+        int samples = wake_word_detect_.GetFeedSize();
+        if (samples > 0) {
+            ReadAudio(data, 16000, samples);
+            wake_word_detect_.Feed(data);
+            return;
+        }
     }
 #endif
-#if CONFIG_USE_AUDIO_PROCESSOR
-    if (audio_processor_.IsRunning()) {
+    if (audio_processor_->IsRunning()) {
         std::vector<int16_t> data;
-        ReadAudio(data, 16000, audio_processor_.GetFeedSize());
-        audio_processor_.Feed(data);
-        return;
+        int samples = audio_processor_->GetFeedSize();
+        if (samples > 0) {
+            ReadAudio(data, 16000, samples);
+            audio_processor_->Feed(data);
+            return;
+        }
     }
-#else
-    if (device_state_ == kDeviceStateListening) {
-        std::vector<int16_t> data;
-        ReadAudio(data, 16000, 30 * 16000 / 1000);
-        background_task_->Schedule([this, data = std::move(data)]() mutable {
-            if (protocol_->IsAudioChannelBusy()) {
-                return;
-            }
-            opus_encoder_->Encode(std::move(data), [this](std::vector<uint8_t>&& opus) {
-                Schedule([this, opus = std::move(opus)]() {
-                    protocol_->SendAudio(opus);
-                });
-            });
-        });
-        return;
-    }
-#endif
+
     vTaskDelay(pdMS_TO_TICKS(30));
 }
 
@@ -748,9 +815,7 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-#if CONFIG_USE_AUDIO_PROCESSOR
-            audio_processor_.Stop();
-#endif
+            audio_processor_->Stop();
 #if CONFIG_USE_WAKE_WORD_DETECT
             wake_word_detect_.StartDetection();
 #endif
@@ -768,11 +833,7 @@ void Application::SetDeviceState(DeviceState state) {
             UpdateIotStates();
 
             // Make sure the audio processor is running
-#if CONFIG_USE_AUDIO_PROCESSOR
-            if (!audio_processor_.IsRunning()) {
-#else
-            if (true) {
-#endif
+            if (!audio_processor_->IsRunning()) {
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
                 if (listening_mode_ == kListeningModeAutoStop && previous_state == kDeviceStateSpeaking) {
@@ -783,18 +844,14 @@ void Application::SetDeviceState(DeviceState state) {
 #if CONFIG_USE_WAKE_WORD_DETECT
                 wake_word_detect_.StopDetection();
 #endif
-#if CONFIG_USE_AUDIO_PROCESSOR
-                audio_processor_.Start();
-#endif
+                audio_processor_->Start();
             }
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
-#if CONFIG_USE_AUDIO_PROCESSOR
-                audio_processor_.Stop();
-#endif
+                audio_processor_->Stop();
 #if CONFIG_USE_WAKE_WORD_DETECT
                 wake_word_detect_.StartDetection();
 #endif

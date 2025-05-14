@@ -42,7 +42,7 @@ void WifiBoard::EnterWifiConfigMode() {
 
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage(Lang::CODE);
-    wifi_ap.SetSsidPrefix("Watcher");
+    wifi_ap.SetSsidPrefix("Xiaozhi");
     wifi_ap.Start();
 
     // 显示 WiFi 配置 AP 的 SSID 和 Web 服务器 URL
@@ -114,20 +114,13 @@ Http* WifiBoard::CreateHttp() {
 }
 
 WebSocket* WifiBoard::CreateWebSocket() {
-#ifdef CONFIG_CONNECTION_TYPE_WEBSOCKET
-    std::string url = CONFIG_WEBSOCKET_URL;
     Settings settings("websocket", false);
-    std::string config_url = settings.GetString("url");
-    if ( !config_url.empty() ) {
-        url = config_url;
-    }
-    ESP_LOGI(TAG, "WebSocket URL: %s", url.c_str());
+    std::string url = settings.GetString("url");
     if (url.find("wss://") == 0) {
         return new WebSocket(new TlsTransport());
     } else {
         return new WebSocket(new TcpTransport());
     }
-#endif
     return nullptr;
 }
 
