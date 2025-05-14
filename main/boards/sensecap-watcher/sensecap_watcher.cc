@@ -503,37 +503,6 @@ private:
             .context =this
         };
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmd5));
-
-        WebSocketArgs.url = arg_str0("a", "addr", "<url>", "WebSocket URL");
-        WebSocketArgs.token = arg_str0("t", "token", "<token>", "WebSocket Token");
-        WebSocketArgs.end = arg_end(2);
-        const esp_console_cmd_t cmd6 = {
-            .command = "websocket",
-            .help = "set websocket url and token",
-            .hint = NULL,
-            .func = NULL,
-            .argtable = NULL,
-            .func_w_context = [](void *context,int argc, char** argv) -> int {
-                int nerrors = arg_parse(argc, argv, (void **) &WebSocketArgs);
-                if (nerrors != 0) {
-                    arg_print_errors(stderr, WebSocketArgs.end, argv[0]);
-                    return 1;
-                }
-                Settings settings("websocket", true);
-                std::string config_url = settings.GetString("url");
-
-                if (WebSocketArgs.url->count) {
-                    settings.SetString("url", WebSocketArgs.url->sval[0]);
-                }
-                if (WebSocketArgs.token->count) {
-                    settings.SetString("token", WebSocketArgs.token->sval[0]);
-                }
-                return 0;
-            },
-            .context =this
-        };
-        ESP_ERROR_CHECK( esp_console_cmd_register(&cmd6) );
-
         
         esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
